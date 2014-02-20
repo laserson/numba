@@ -274,6 +274,47 @@ class DoubleValTypeAttr(AttributeTemplate):
         return DoubleVal
 
 
+StringVal = ImpalaValue('StringVal')
+StringValType = types.Dummy('StringValType')
+
+
+class StringValCtor(ConcreteTemplate):
+    key = StringValType
+    cases = [signature(StringVal, types.CPointer(types.uint8), types.int32)]
+
+
+class StringValValueAttr(AttributeTemplate):
+    key = StringVal
+
+    def resolve_is_null(self, val):
+	"""
+	StringVal::is_null
+	"""
+	return types.boolean
+
+    def resolve_len(self, val):
+	"""
+	StringVal::len
+	"""
+	return types.int32
+
+    def resolve_ptr(self, val):
+	"""
+	StringVal::ptr
+	"""
+	return types.CPointer(types.uint8)
+
+
+class StringValTypeAttr(AttributeTemplate):
+    key = StringValType
+
+    def resolve_null(self, typ):
+	"""
+	StringVal::null
+	"""
+	return StringVal
+
+
 class UDF(object):
     def __init__(self, pyfunc, signature):
         self.py_func = pyfunc
@@ -331,6 +372,11 @@ def impala_typing_context():
     base.insert_attributes(DoubleValValueAttr(base))
     base.insert_attributes(DoubleValTypeAttr(base))
     
+    base.insert_global(StringVal, StringValType)
+    base.insert_function(StringValCtor(base))
+    base.insert_attributes(StringValValueAttr(base))
+    base.insert_attributes(StringValTypeAttr(base))
+
     return base
 
 
@@ -670,6 +716,71 @@ def doubleval_ctor(context, builder, sig, args):
     iv.val = x
     return iv._getvalue()
 
+
+class StringValStruct(cgutils.Structure):
+    _fields = [('parent',  AnyVal),
+	       ('len',     types.int32),
+	       ('ptr',     types.CPointer(types.uint8))]
+
+
+@impl_attribute(StringVal, "is_null", types.boolean)
+def stringval_is_null(context, builder, typ, value):
+    """
+    StringVal::is_null
+    """
+    iv = StringValStruct(context, builder, value=value)
+    is_null = _get_is_null(builder, iv)
+    return is_null
+
+@impl_attribute(StringVal, "len", types.int32)
+def stringval_len(context, builder, typ, value):
+    """
+    StringVal::len
+    """
+    iv = StringValStruct(context, builder, value=value)
+    return iv.len
+
+@impl_attribute(StringVal, "ptr", types.CPointer(types.uint8))
+def stringval_ptr(context, builder, typ, value):
+    """
+    StringVal::ptr
+    """
+    iv = StringValStruct(context, builder, value=value)
+    return iv.ptr
+
+@impl_attribute(StringValType, "null", StringVal)
+def stringval_null(context, builder, typ, value):
+    """
+    StringVal::null
+    """
+    iv = StringValStruct(context, builder)
+    _set_is_null(builder, iv, cgutils.true_bit)
+    return iv._getvalue()
+
+@implement(StringValType, types.CPointer(types.uint8), types.int32)
+def stringval_ctor1(context, builder, sig, args):
+    """
+    StringVal(uint8*, int32)
+    """
+    [x, y] = args
+    iv = StringValStruct(context, builder)
+    _set_is_null(builder, iv, cgutils.false_bit)
+    iv.ptr = x
+    iv.len = y
+    return iv._getvalue()
+
+@implement(StringValType, types.CPointer(FunctionContext), types.int32)
+def stringval_ctor2(context, builder, sig, args):
+    """
+    StringVal(FunctionContext*, int32)
+    """
+    [x, y] = args
+    iv = StringValStruct(context, builder)
+    _set_is_null(builder, iv, cgutils.false_bit)
+    iv.ptr = x.
+    iv.len = y
+    return iv._getvalue()
+
 TYPE_LAYOUT = {
     AnyVal: AnyValStruct,
     BooleanVal: BooleanValStruct,
@@ -679,6 +790,7 @@ TYPE_LAYOUT = {
     BigIntVal: BigIntValStruct,
     FloatVal: FloatValStruct,
     DoubleVal: DoubleValStruct,
+    StringVal: StringValStruct,
 }
 
 
@@ -691,10 +803,11 @@ class ImpalaTargetContext(BaseContext):
                                intval_is_null, intval_val, intval_null,
                                bigintval_is_null, bigintval_val, bigintval_null,
                                floatval_is_null, floatval_val, floatval_null,
-                               doubleval_is_null, doubleval_val, doubleval_null])
+			       doubleval_is_null, doubleval_val, doubleval_null,
+			       stringval_is_null, stringval_len, stringval_ptr, stringval_null])
         self.insert_func_defn([booleanval_ctor, tinyintval_ctor,
                                smallintval_ctor, intval_ctor, bigintval_ctor,
-                               floatval_ctor, doubleval_ctor])
+			       floatval_ctor, doubleval_ctor, stringval_ctor1])
         self.optimizer = self.build_pass_manager()
 
         # once per context
@@ -827,6 +940,19 @@ class ABIHandling(object):
                                                     0)
             asstructi8double = builder.insert_value(asstructi8double, iv.val, 1)
             return asstructi8double
+	elif ty == StringVal:
+	    # Pack structure into { int64, int8* }
+	    # Endian specific
+	    iv = StringValStruct(self.context, builder, value=val)
+	    is_null = builder.zext(_get_is_null(builder, iv), lc.Type.int(64))
+	    len_ = builder.zext(iv.len, lc.Type.int(64))
+	    asint64 = builder.shl(len_, lc.Constant.int(lc.Type.int(64), 32))
+	    asint64 = builder.or_(asint64, is_null)
+	    asstructi64i8p = builder.insert_value(lc.Constant.undef(lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])),
+						  asint64,
+						  0)
+	    asstructi64i8p = builder.insert_value(asstructi64i8p, iv.ptr, 1)
+	    return asstructi64i8p
         else:
             return val
 
@@ -846,6 +972,8 @@ class ABIHandling(object):
             return lc.Type.int(64)
         elif ty == DoubleVal:
             return lc.Type.struct([lc.Type.int(8), lc.Type.double()])
+	elif ty == StringVal:
+	    return lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])
         else:
             return self.context.get_return_type(ty)
         return self.context.get_return_type(ty)
