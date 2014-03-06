@@ -315,9 +315,14 @@ class StringValTypeAttr(AttributeTemplate):
 	return StringVal
 
 
+class LenStringVal(ConcreteTemplate):
+    key = types.len_type
+    cases = [signature(types.int32, StringVal)]
+
+
 class UDF(object):
     def __init__(self, pyfunc, signature):
-        self.py_func = pyfunc
+    	self.py_func = pyfunc
         self.signature = signature
         self.name = pyfunc.__name__
 
@@ -376,6 +381,7 @@ def impala_typing_context():
     base.insert_function(StringValCtor(base))
     base.insert_attributes(StringValValueAttr(base))
     base.insert_attributes(StringValTypeAttr(base))
+    base.insert_function(LenStringVal(base))
 
     return base
 
@@ -757,6 +763,13 @@ def stringval_null(context, builder, typ, value):
     _set_is_null(builder, iv, cgutils.true_bit)
     return iv._getvalue()
 
+@implement(types.len_type, StringVal)
+def len_stringval(context, builder, sig, args):
+    [s] = args
+    val = StringValStruct(context, builder, value=s)
+    return val.len
+
+
 @implement(StringValType, types.CPointer(types.uint8), types.int32)
 def stringval_ctor1(context, builder, sig, args):
     """
@@ -769,17 +782,17 @@ def stringval_ctor1(context, builder, sig, args):
     iv.len = y
     return iv._getvalue()
 
-@implement(StringValType, types.CPointer(FunctionContext), types.int32)
-def stringval_ctor2(context, builder, sig, args):
-    """
-    StringVal(FunctionContext*, int32)
-    """
-    [x, y] = args
-    iv = StringValStruct(context, builder)
-    _set_is_null(builder, iv, cgutils.false_bit)
-    iv.ptr = x.
-    iv.len = y
-    return iv._getvalue()
+# @implement(StringValType, types.CPointer(FunctionContext), types.int32)
+# def stringval_ctor2(context, builder, sig, args):
+#     """
+#     StringVal(FunctionContext*, int32)
+#     """
+#     [x, y] = args
+#     iv = StringValStruct(context, builder)
+#     _set_is_null(builder, iv, cgutils.false_bit)
+#     iv.ptr = x.
+#     iv.len = y
+#     return iv._getvalue()
 
 TYPE_LAYOUT = {
     AnyVal: AnyValStruct,
@@ -803,14 +816,15 @@ class ImpalaTargetContext(BaseContext):
                                intval_is_null, intval_val, intval_null,
                                bigintval_is_null, bigintval_val, bigintval_null,
                                floatval_is_null, floatval_val, floatval_null,
-			       doubleval_is_null, doubleval_val, doubleval_null,
-			       stringval_is_null, stringval_len, stringval_ptr, stringval_null])
-        self.insert_func_defn([booleanval_ctor, tinyintval_ctor,
-                               smallintval_ctor, intval_ctor, bigintval_ctor,
-			       floatval_ctor, doubleval_ctor, stringval_ctor1])
-        self.optimizer = self.build_pass_manager()
+            			       doubleval_is_null, doubleval_val, doubleval_null,
+            			       stringval_is_null, stringval_len, stringval_ptr, stringval_null])
+    	self.insert_func_defn([booleanval_ctor, tinyintval_ctor,
+            			       smallintval_ctor, intval_ctor, bigintval_ctor,
+            			       floatval_ctor, doubleval_ctor, stringval_ctor1,
+            			       len_stringval])
+    	self.optimizer = self.build_pass_manager()
 
-        # once per context
+    	# once per context
         self._fnctximpltype = lc.Type.opaque("FunctionContextImpl")
         fnctxbody = [lc.Type.pointer(self._fnctximpltype)]
         self._fnctxtype = lc.Type.struct(fnctxbody,
