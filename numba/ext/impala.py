@@ -1,4 +1,5 @@
 from __future__ import print_function, division, absolute_import
+import itertools
 import llvm.core as lc
 import llvm.passes as lp
 import llvm.ee as le
@@ -27,7 +28,6 @@ class ImpalaValue(types.Type):
     pass
 
 AnyVal = ImpalaValue('AnyVal')
-
 
 BooleanVal = ImpalaValue('BooleanVal')
 BooleanValType = types.Dummy('BooleanValType')
@@ -320,6 +320,11 @@ class LenStringVal(ConcreteTemplate):
     cases = [signature(types.int32, StringVal)]
 
 
+class BinOpIs(ConcreteTemplate):
+    key = 'is'
+    cases = [signature(types.int8, AnyVal, types.none)]
+
+
 class UDF(object):
     def __init__(self, pyfunc, signature):
     	self.py_func = pyfunc
@@ -339,8 +344,61 @@ class UDF(object):
         self.llvm_module = llvm_func.module
 
 
+def _register_impala_type_conversions(base):
+    impala_integral = (BooleanVal, TinyIntVal, SmallIntVal, IntVal, BigIntVal)
+    impala_float = (FloatVal, DoubleVal)
+    impala_all = impala_integral + impala_float
+    numba_integral = (types.boolean, types.int8, types.int16, types.int32, types.int64)
+    numba_float = (types.float32, types.float64)
+    numba_all = numba_integral + numba_float
+    
+    # first, all *Val types can convert to concrete types
+    for a, b in itertools.product(impala_all, numba_all):
+        base.tm.set_unsafe_convert(a, b)
+        base.tm.set_unsafe_convert(b, a)
+    
+    # set safe conversions
+    for a, b in zip(impala_all, numba_all):
+        base.tm.set_safe_convert(a, b)
+        base.tm.set_safe_convert(b, a)
+    
+    # set up promotions
+    for i in range(len(impala_integral)):
+        for j in range(i + 1, len(numba_integral)):
+            base.tm.set_promote(impala_integral[i], numba_integral[j])
+            base.tm.set_promote(numba_integral[i], impala_integral[j])
+    for i in range(len(impala_float)):
+        for j in range(i + 1, len(numba_float)):
+            base.tm.set_promote(impala_float[i], numba_float[j])
+            base.tm.set_promote(numba_float[i], impala_float[j])
+    
+    # boolean safely promotes to everything
+    for b in impala_all[1:]:
+        base.tm.set_promote(types.boolean, b)
+    for b in numba_all[1:]:
+        base.tm.set_promote(BooleanVal, b)
+    
+    # int to float conversions
+    for a in impala_integral[:-2]:
+        base.tm.set_safe_convert(a, types.float32)
+        base.tm.set_safe_convert(a, types.float64)
+    for a in numba_integral[:-2]:
+        base.tm.set_safe_convert(a, FloatVal)
+        base.tm.set_safe_convert(a, DoubleVal)
+    base.tm.set_safe_convert(impala_integral[-2], types.float64)
+    base.tm.set_safe_convert(numba_integral[-2], DoubleVal)
+    
+    # *Val to AnyVal
+    for a in impala_all:
+        base.tm.set_unsafe_convert(a, AnyVal)
+
+
 def impala_typing_context():
     base = typing.Context()
+    
+    _register_impala_type_conversions(base)
+    
+    base.insert_function(BinOpIs(base))
     
     base.insert_global(BooleanVal, BooleanValType)
     base.insert_function(BooleanValCtor(base))
@@ -393,6 +451,13 @@ class AnyValStruct(cgutils.Structure):
     _fields = [('is_null', types.boolean)]
 
 
+@implement('is', AnyVal, types.none)
+def isnone_anyval(context, builder, sig, args):
+    [x, y] = args
+    val = AnyValStruct(context, builder, value=x)
+    return val.is_null
+
+
 def _get_is_null_pointer(builder, val):
     ptr = cgutils.inbound_gep(builder, val._getpointer(), 0, 0, 0)
     return ptr
@@ -406,6 +471,18 @@ def _get_is_null(builder, val):
 def _set_is_null(builder, val, is_null):
     byte = builder.zext(is_null, lc.Type.int(8))
     builder.store(byte, _get_is_null_pointer(builder, val))
+
+
+def _get_val_pointer(builder, val):
+    ptr = cgutils.inbound_gep(builder, val._getpointer(), 0, 1)
+    return ptr
+
+def _get_val(builder, val):
+    raw_val = builder.load(_get_val_pointer(builder, val))
+    return raw_val
+
+def _set_val(builder, val, to):
+    builder.store(to, _get_val_pointer(builder, val))
 
 
 class BooleanValStruct(cgutils.Structure):
@@ -821,7 +898,7 @@ class ImpalaTargetContext(BaseContext):
     	self.insert_func_defn([booleanval_ctor, tinyintval_ctor,
             			       smallintval_ctor, intval_ctor, bigintval_ctor,
             			       floatval_ctor, doubleval_ctor, stringval_ctor1,
-            			       len_stringval])
+            			       len_stringval, isnone_anyval])
     	self.optimizer = self.build_pass_manager()
 
     	# once per context
@@ -829,6 +906,77 @@ class ImpalaTargetContext(BaseContext):
         fnctxbody = [lc.Type.pointer(self._fnctximpltype)]
         self._fnctxtype = lc.Type.struct(fnctxbody,
                                         name="class.impala_udf::FunctionContext")
+
+    def cast(self, builder, val, fromty, toty):
+        if toty == AnyVal:
+            # TODO: we should check to make sure fromty is an Impala *Val type
+            iv1 = TYPE_LAYOUT[fromty](self, builder, value=val)
+            is_null = _get_is_null(builder, iv1)
+            iv2 = AnyValStruct(self, builder)
+            # this is equiv to _set_is_null, but changes the GEP bc of AnyVal's structure
+            byte = builder.zext(is_null, lc.Type.int(8))
+            builder.store(byte, cgutils.inbound_gep(builder, iv2._getpointer(), 0, 0))
+            return iv2._getvalue()
+        
+        if fromty == BooleanVal:
+            raw_val = _get_val(builder, BooleanValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.boolean, toty)
+        if fromty == TinyIntVal:
+            raw_val = _get_val(builder, TinyIntValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.int8, toty)
+        if fromty == SmallIntVal:
+            raw_val = _get_val(builder, SmallIntVal(self, builder, val))
+            return self.cast(builder, raw_val, types.int16, toty)
+        if fromty == IntVal:
+            raw_val = _get_val(builder, IntValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.int32, toty)
+        if fromty == BigIntVal:
+            raw_val = _get_val(builder, BigIntValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.int64, toty)
+        if fromty == FloatVal:
+            raw_val = _get_val(builder, FloatValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.float32, toty)    
+        if fromty == DoubleVal:
+            raw_val = _get_val(builder, DoubleValStruct(self, builder, val))
+            return self.cast(builder, raw_val, types.float64, toty)
+        
+        if toty == BooleanVal:
+            iv = BooleanValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == TinyIntVal:
+            iv = TinyIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == SmallIntVal:
+            iv = SmallIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == IntVal:
+            iv = IntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == BigIntVal:
+            iv = BigIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == FloatVal:
+            iv = FloatValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        if toty == DoubleVal:
+            iv = DoubleValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            _set_val(builder, iv, val)
+            return iv._getvalue()
+        
+        return super(ImpalaTargetContext, self).cast(builder, val, fromty, toty)
 
     def get_data_type(self, ty):
         if ty in TYPE_LAYOUT:
@@ -954,19 +1102,19 @@ class ABIHandling(object):
                                                     0)
             asstructi8double = builder.insert_value(asstructi8double, iv.val, 1)
             return asstructi8double
-	elif ty == StringVal:
-	    # Pack structure into { int64, int8* }
-	    # Endian specific
-	    iv = StringValStruct(self.context, builder, value=val)
-	    is_null = builder.zext(_get_is_null(builder, iv), lc.Type.int(64))
-	    len_ = builder.zext(iv.len, lc.Type.int(64))
-	    asint64 = builder.shl(len_, lc.Constant.int(lc.Type.int(64), 32))
-	    asint64 = builder.or_(asint64, is_null)
-	    asstructi64i8p = builder.insert_value(lc.Constant.undef(lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])),
-						  asint64,
-						  0)
-	    asstructi64i8p = builder.insert_value(asstructi64i8p, iv.ptr, 1)
-	    return asstructi64i8p
+    	elif ty == StringVal:
+    	    # Pack structure into { int64, int8* }
+    	    # Endian specific
+    	    iv = StringValStruct(self.context, builder, value=val)
+    	    is_null = builder.zext(_get_is_null(builder, iv), lc.Type.int(64))
+    	    len_ = builder.zext(iv.len, lc.Type.int(64))
+    	    asint64 = builder.shl(len_, lc.Constant.int(lc.Type.int(64), 32))
+    	    asint64 = builder.or_(asint64, is_null)
+    	    asstructi64i8p = builder.insert_value(lc.Constant.undef(lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])),
+    						  asint64,
+    						  0)
+    	    asstructi64i8p = builder.insert_value(asstructi64i8p, iv.ptr, 1)
+    	    return asstructi64i8p
         else:
             return val
 
@@ -986,8 +1134,8 @@ class ABIHandling(object):
             return lc.Type.int(64)
         elif ty == DoubleVal:
             return lc.Type.struct([lc.Type.int(8), lc.Type.double()])
-	elif ty == StringVal:
-	    return lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])
+    	elif ty == StringVal:
+    	    return lc.Type.struct([lc.Type.int(64), lc.Type.pointer(lc.Type.int(8))])
         else:
             return self.context.get_return_type(ty)
         return self.context.get_return_type(ty)
