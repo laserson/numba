@@ -9,6 +9,7 @@ from numba.targets.base import BaseContext
 from numba.typing.templates import (AttributeTemplate, ConcreteTemplate,
                                     signature)
 from numba.targets.imputils import implement, impl_attribute
+from numba.config import DEBUG
 
 
 def udf(signature):
@@ -166,7 +167,6 @@ class IntValTypeAttr(AttributeTemplate):
         IntVal::null
         """
         return IntVal
-
 
 
 BigIntVal = ImpalaValue('BigIntVal')
@@ -344,59 +344,70 @@ class UDF(object):
         self.llvm_module = llvm_func.module
 
 
-def _register_impala_type_conversions(base):
+def _register_impala_numeric_type_conversions(base):
     impala_integral = (BooleanVal, TinyIntVal, SmallIntVal, IntVal, BigIntVal)
     impala_float = (FloatVal, DoubleVal)
     impala_all = impala_integral + impala_float
     numba_integral = (types.boolean, types.int8, types.int16, types.int32, types.int64)
     numba_float = (types.float32, types.float64)
     numba_all = numba_integral + numba_float
+    all_numeric = impala_all + numba_all
     
-    # first, all *Val types can convert to concrete types
-    for a, b in itertools.product(impala_all, numba_all):
+    # first, all numeric types can cast to all others
+    for a, b in itertools.product(all_numeric, all_numeric):
         base.tm.set_unsafe_convert(a, b)
         base.tm.set_unsafe_convert(b, a)
     
-    # set safe conversions
+    # match Numba-Impala types
     for a, b in zip(impala_all, numba_all):
-        base.tm.set_safe_convert(a, b)
-        base.tm.set_safe_convert(b, a)
+        # base.tm.set_safe_convert(a, b)
+        # base.tm.set_safe_convert(b, a)
+        base.tm.set_unsafe_convert(a, b)
+        base.tm.set_promote(b, a)
     
     # set up promotions
     for i in range(len(impala_integral)):
         for j in range(i + 1, len(numba_integral)):
             base.tm.set_promote(impala_integral[i], numba_integral[j])
             base.tm.set_promote(numba_integral[i], impala_integral[j])
+            base.tm.set_promote(impala_integral[i], impala_integral[j])
     for i in range(len(impala_float)):
         for j in range(i + 1, len(numba_float)):
             base.tm.set_promote(impala_float[i], numba_float[j])
             base.tm.set_promote(numba_float[i], impala_float[j])
+            base.tm.set_promote(impala_float[i], impala_float[j])
     
     # boolean safely promotes to everything
-    for b in impala_all[1:]:
+    for b in impala_all:
         base.tm.set_promote(types.boolean, b)
-    for b in numba_all[1:]:
+    for b in all_numeric:
         base.tm.set_promote(BooleanVal, b)
     
     # int to float conversions
     for a in impala_integral[:-2]:
         base.tm.set_safe_convert(a, types.float32)
         base.tm.set_safe_convert(a, types.float64)
+        base.tm.set_safe_convert(a, FloatVal)
+        base.tm.set_safe_convert(a, DoubleVal)
     for a in numba_integral[:-2]:
         base.tm.set_safe_convert(a, FloatVal)
         base.tm.set_safe_convert(a, DoubleVal)
     base.tm.set_safe_convert(impala_integral[-2], types.float64)
+    base.tm.set_safe_convert(impala_integral[-2], DoubleVal)
     base.tm.set_safe_convert(numba_integral[-2], DoubleVal)
     
     # *Val to AnyVal
     for a in impala_all:
         base.tm.set_unsafe_convert(a, AnyVal)
+    
+    for a in impala_all:
+        base.tm.set_safe_convert(types.none, a)
 
 
 def impala_typing_context():
     base = typing.Context()
     
-    _register_impala_type_conversions(base)
+    _register_impala_numeric_type_conversions(base)
     
     base.insert_function(BinOpIs(base))
     
@@ -885,6 +896,8 @@ TYPE_LAYOUT = {
 
 
 class ImpalaTargetContext(BaseContext):
+    _impala_types = (AnyVal, BooleanVal, TinyIntVal, SmallIntVal, IntVal,
+                BigIntVal, FloatVal, DoubleVal, StringVal)
     def init(self):
         self.tm = le.TargetMachine.new()
         self.insert_attr_defn([booleanval_is_null, booleanval_val, booleanval_null,
@@ -908,8 +921,18 @@ class ImpalaTargetContext(BaseContext):
                                         name="class.impala_udf::FunctionContext")
 
     def cast(self, builder, val, fromty, toty):
-        if toty == AnyVal:
-            # TODO: we should check to make sure fromty is an Impala *Val type
+        if DEBUG:
+            print("CAST %s => %s" % (fromty, toty))
+        
+        if fromty not in self._impala_types and toty not in self._impala_types:
+            return super(ImpalaTargetContext, self).cast(builder, val, fromty, toty)
+        
+        # handle NULLs and Nones
+        if fromty == types.none and toty in self._impala_types:
+            iv = TYPE_LAYOUT[toty](self, builder)
+            _set_is_null(builder, iv, cgutils.true_bit)
+            return iv._getvalue()
+        if fromty in self._impala_types and toty == AnyVal:
             iv1 = TYPE_LAYOUT[fromty](self, builder, value=val)
             is_null = _get_is_null(builder, iv1)
             iv2 = AnyValStruct(self, builder)
@@ -925,7 +948,7 @@ class ImpalaTargetContext(BaseContext):
             raw_val = _get_val(builder, TinyIntValStruct(self, builder, val))
             return self.cast(builder, raw_val, types.int8, toty)
         if fromty == SmallIntVal:
-            raw_val = _get_val(builder, SmallIntVal(self, builder, val))
+            raw_val = _get_val(builder, SmallIntValStruct(self, builder, val))
             return self.cast(builder, raw_val, types.int16, toty)
         if fromty == IntVal:
             raw_val = _get_val(builder, IntValStruct(self, builder, val))
@@ -940,37 +963,45 @@ class ImpalaTargetContext(BaseContext):
             raw_val = _get_val(builder, DoubleValStruct(self, builder, val))
             return self.cast(builder, raw_val, types.float64, toty)
         
+        # no way fromty is a *Val starting here
         if toty == BooleanVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.boolean)
             iv = BooleanValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == TinyIntVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.int8)
             iv = TinyIntValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == SmallIntVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.int16)
             iv = SmallIntValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == IntVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.int32)
             iv = IntValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == BigIntVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.int64)
             iv = BigIntValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == FloatVal:
             iv = FloatValStruct(self, builder)
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.float32)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
             return iv._getvalue()
         if toty == DoubleVal:
+            val = super(ImpalaTargetContext, self).cast(builder, val, fromty, types.float64)
             iv = DoubleValStruct(self, builder)
             _set_is_null(builder, iv, cgutils.false_bit)
             _set_val(builder, iv, val)
@@ -978,6 +1009,50 @@ class ImpalaTargetContext(BaseContext):
         
         return super(ImpalaTargetContext, self).cast(builder, val, fromty, toty)
 
+    def get_constant_struct(self, builder, ty, val):
+        # override for converting literals to *Vals, incl. None
+        if ty in self._impala_types and val is None:
+            iv = TYPE_LAYOUT[ty](self, builder)
+            _set_is_null(builder, iv, cgutils.true_bit)
+            return iv._getvalue()
+        elif ty == BooleanVal:
+            iv = BooleanValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.int(lc.Type.int(1), val)
+            return iv._getvalue()
+        elif ty == TinyIntVal:
+            iv = TinyIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.int(lc.Type.int(8), val)
+            return iv._getvalue()
+        elif ty == SmallIntVal:
+            iv = SmallIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.int(lc.Type.int(16), val)
+            return iv._getvalue()
+        elif ty == IntVal:
+            iv = IntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.int(lc.Type.int(32), val)
+            return iv._getvalue()
+        elif ty == BigIntVal:
+            iv = BigIntValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.int(lc.Type.int(64), val)
+            return iv._getvalue()
+        elif ty == FloatVal:
+            iv = FloatValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.real(lc.Type.float(), val)
+            return iv._getvalue()
+        elif ty == DoubleVal:
+            iv = DoubleValStruct(self, builder)
+            _set_is_null(builder, iv, cgutils.false_bit)
+            iv.val = lc.Constant.real(lc.Type.double(), val)
+            return iv._getvalue()
+        else:
+            super(ImpalaTargetContext, self).get_constant_struct(builder, ty, val)
+            
     def get_data_type(self, ty):
         if ty in TYPE_LAYOUT:
             return self.get_struct_type(TYPE_LAYOUT[ty])
