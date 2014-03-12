@@ -60,7 +60,7 @@ packages = [
     "numba.typeconv",
     "numba.npyufunc",
     "numba.pycc",
-    "numba.ext"
+    "numba.ext.impala"
 ]
 
 setup(name='numba',
