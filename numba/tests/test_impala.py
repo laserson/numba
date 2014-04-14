@@ -118,7 +118,20 @@ class TestImpala(unittest.TestCase):
         def fn(context, a):
             return len(a)
 
+    def test_string_concat(self):
+        @udf(StringVal(FunctionContext, StringVal, StringVal))
+        def fn(context, a, b):
+            return a + b
 
+    def test_string_index_concat(self):
+        @udf(StringVal(FunctionContext, StringVal))
+        def fn(context, a):
+            return a[0] + a[3]
+
+    def test_string_indexing(self):
+        @udf(StringVal(FunctionContext, StringVal, IntVal))
+        def fn(context, a, b):
+            return a[b]
 
 
 if __name__ == '__main__':
