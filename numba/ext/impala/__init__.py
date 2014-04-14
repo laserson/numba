@@ -20,6 +20,11 @@ class UDF(object):
         self.py_func = pyfunc
         self.signature = signature
         self.name = pyfunc.__name__
+        
+        # recreate for each UDF, as linking is destructive to the 
+        # precompiled module
+        impala_typing = impala_typing_context()
+        impala_targets = ImpalaTargetContext(impala_typing)
 
         args, return_type = sigutils.normalize_signature(signature)
         flags = Flags()
@@ -34,7 +39,4 @@ class UDF(object):
         numba_module = llvm_func.module
         self.llvm_module = lc.Module.new(self.name)
         self.llvm_module.link_in(numba_module)
-        self.llvm_module.link_in(impala_targets.precompiled_module, preserve=True)
-
-impala_typing = impala_typing_context()
-impala_targets = ImpalaTargetContext(impala_typing)
+        self.llvm_module.link_in(impala_targets.precompiled_module)
