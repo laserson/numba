@@ -1,4 +1,5 @@
 from __future__ import print_function, division, absolute_import
+import pkgutil
 import llvm.core as lc
 import llvm.passes as lp
 import llvm.ee as le
@@ -272,26 +273,18 @@ class ImpalaTargetContext(BaseContext):
         self._fnctxtype = lc.Type.struct(fnctxbody,
                                          name="class.impala_udf::FunctionContext")
 
-    def _get_precompiled_function(self, name):
+    def _load_precompiled_function(self, name):
         fns = [fn for fn in self.precompiled_module.functions if name in fn.name]
         assert len(fns) == 1
-        return fns[0]
+        self.precompiled_fns[name] = fns[0]
 
     def _load_precompiled(self):
-        # TODO: find a way to precompile as part of build and point accordingly
-        with open("/Users/laserson/repos/numba/numba/ext/impala/impala-precompiled.bc", "rb") as ip:
-            self.precompiled_module = lc.Module.from_bitcode(ip)
-        
+        binary_data = pkgutil.get_data("numba.ext.impala", "precompiled/impala-precompiled.bc")
+        self.precompiled_module = lc.Module.from_bitcode(binary_data)
         self.precompiled_fns = {}
-        
-        name = "EqStringValImpl"
-        self.precompiled_fns[name] = self._get_precompiled_function(name)
-        
-        name = "GetItemStringValImpl"
-        self.precompiled_fns[name] = self._get_precompiled_function(name)
-        
-        name = "AddStringValImpl"
-        self.precompiled_fns[name] = self._get_precompiled_function(name)
+        self._load_precompiled_function("EqStringValImpl")
+        self._load_precompiled_function("GetItemStringValImpl")
+        self._load_precompiled_function("AddStringValImpl")
 
     def cast(self, builder, val, fromty, toty):
         if config.DEBUG:
