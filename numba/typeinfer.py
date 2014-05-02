@@ -145,6 +145,29 @@ class BuildTupleConstrain(object):
             oset.add_types(tup)
 
 
+class BuildListConstrain(object):
+    def __init__(self, target, items, loc):
+        self.target = target
+        self.items = items
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        import sys
+        sys.stderr.write("typeinfer.py: BuildListConstrain\n")
+        sys.stderr.flush()
+        tsets = [typevars[i.name].get() for i in self.items]
+        oset = typevars[self.target]
+        for vals in itertools.product(*tsets):
+            if all(vals[0] == v for v in vals):
+                list_ = types.Array(dtype=vals[0], ndim=1, layout='C')
+            else:
+                # TODO: not yet implemented; for now just pass and hope we don't
+                #       get here
+                # tup = types.Tuple(vals)
+                raise NotImplementedError("Lists must have uniform type for now")
+            oset.add_types(list_)
+
+
 class CallConstrain(object):
     """Constrain for calling functions.
     Perform case analysis foreach combinations of argument types.
@@ -573,6 +596,13 @@ class TypeInferer(object):
         elif expr.op == 'build_tuple':
             constrain = BuildTupleConstrain(target.name, items=expr.items,
                                             loc=inst.loc)
+            self.constrains.append(constrain)
+        elif expr.op == 'build_list':
+            import sys
+            sys.stderr.write("typeinfer.py: build_list\n")
+            sys.stderr.flush()
+            constrain = BuildListConstrain(target.name, items=expr.items,
+                                           loc=inst.loc)
             self.constrains.append(constrain)
         else:
             raise NotImplementedError(type(expr), expr)

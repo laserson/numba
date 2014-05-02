@@ -751,13 +751,23 @@ class BaseContext(object):
         flat = ary.flatten()
 
         # Handle data
-        if self.is_struct_type(typ.dtype):
+        # if self.is_struct_type(typ.dtype):
             # FIXME
-            raise TypeError("Do not support structure dtype as constant "
-                            "array, yet.")
+            # raise TypeError("Do not support structure dtype as constant "
+                            # "array, yet.")
 
-        values = [self.get_constant(typ.dtype, flat[i])
-                  for i in range(flat.size)]
+        if self.is_struct_type(typ.dtype):
+            import sys
+            sys.stderr.write("base.py: is_struct_type\n")
+            sys.stderr.flush()
+            values = [self.get_constant_struct(builder, typ.dtype, flat[i])
+                      for i in range(flat.size)]
+        else:
+            import sys
+            sys.stderr.write("base.py: else\n")
+            sys.stderr.flush()
+            values = [self.get_constant(typ.dtype, flat[i])
+                      for i in range(flat.size)]
 
         lldtype = values[0].type
         consts = Constant.array(lldtype, values)

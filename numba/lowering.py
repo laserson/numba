@@ -435,6 +435,17 @@ class Lower(BaseLower):
                 tup = self.builder.insert_value(tup, itemvals[i], i)
             return tup
 
+        elif expr.op == "build_list":
+            # TODO: this should differentiate between uniform-type arrays and
+            #       mixed-type lists; currently, only the arrays are supported
+            # delegate to TargetContext methods.  Can be overridden
+            import sys
+            sys.stderr.write("lowering.py: build_list\n")
+            sys.stderr.flush()
+            itemvals = [self.loadvar(i.name) for i in expr.items]
+            itemtys = [self.typeof(i.name) for i in expr.items]
+            return self.context.get_array(self.builder, itemvals, itemtys)
+
         raise NotImplementedError(expr)
 
     def getvar(self, name):
